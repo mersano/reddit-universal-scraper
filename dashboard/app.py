@@ -533,8 +533,7 @@ def main():
                     
                     # Start background process
                     import subprocess
-                    import os
-                    
+
                     job_id = f"job_{int(time.time())}"
                     log_file = LOG_DIR / f"{job_id}.log"
                     
