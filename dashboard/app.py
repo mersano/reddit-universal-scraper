@@ -624,6 +624,18 @@ def main():
             
             # --- PROXY SETTINGS SECTION ---
             with st.expander("🔒 Proxy Settings", expanded=False):
+                st.markdown("""
+                <div style='background: linear-gradient(135deg, #FF4500, #FF8C00); padding: 15px; border-radius: 8px; color: white; margin-bottom: 15px;'>
+                    <h4 style='color: white; margin-top: 0;'>🚀 ScrapingAnt Proxies Recommended</h4>
+                    <p>Prevent IP blocks with <a href='https://scrapingant.com/?ref=yjk4mme' target='_blank' style='color: #FFE4B5; text-decoration: underline; font-weight: bold;'>ScrapingAnt</a>. Use these exclusive coupons at checkout:</p>
+                    <ul style='margin-bottom: 0;'>
+                        <li><b><code>sanjeev_test</code></b> : 1 month free (Micro plan)</li>
+                        <li><b><code>ENTHUSIAST_50</code></b> : 50% off Enthusiast plan</li>
+                        <li><b><code>MICRO_50</code></b> : 50% off Micro residential plan</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+                
                 proxy_provider = st.selectbox(
                     "Proxy Mode",
                     ["Default (from .env)", "No Proxy (Direct Connection)", "Custom Proxy", "ScrapingAnt (Datacenter)", "ScrapingAnt (Residential)"],
