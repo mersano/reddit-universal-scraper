@@ -1,0 +1,45 @@
+name: SCLA Reddit Research
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/scla_reddit_research.py'
+      - '.github/workflows/scla-reddit-research.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+
+      - name: Run Reddit research scan
+        run: |
+          python tools/scla_reddit_research.py \
+            --output-dir research_output \
+            --per-query-limit 50 \
+            --max-results 250
+
+      - name: Upload research output
+        uses: actions/upload-artifact@v4
+        with:
+          name: scla-reddit-research-output
+          path: research_output/
+          retention-days: 7
