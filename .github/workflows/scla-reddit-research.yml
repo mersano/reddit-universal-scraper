@@ -14,7 +14,7 @@ permissions:
 jobs:
   research:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -34,8 +34,9 @@ jobs:
         run: |
           python tools/scla_reddit_research.py \
             --output-dir research_output \
-            --per-query-limit 50 \
-            --max-results 250
+            --per-query-limit 20 \
+            --max-results 120 \
+            --delay 0.15
 
       - name: Upload research output
         uses: actions/upload-artifact@v4
