@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-SCLA Reddit research scanner v3.
+SCLA Reddit research scanner v4.
+
+GitHub Actions often receives HTTP 403 from reddit.com/search.json. This version avoids
+Reddit search and instead scans subreddit listing JSON endpoints from old.reddit/redlib
+mirrors, then filters the collected posts locally.
 
 Goal:
-- Build a manual-review list of Reddit threads related to education, career, honor societies,
-  resume value, networking, scholarships, and membership decisions.
+- Build a manual-review list of recent/top Reddit threads related to education, career,
+  honor societies, resume value, networking, scholarships, and membership decisions.
 - Exclude threads that already mention SCLA / thescla.org.
-- Export opportunities + raw diagnostics so we can see whether Reddit search returned data.
+- Export opportunities + diagnostics.
 
 This script does not post comments and does not automate Reddit engagement.
 """
@@ -17,6 +21,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -25,7 +30,14 @@ from typing import Iterable, Optional
 
 import requests
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SCLAResearchScanner/3.0 manual-research"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+
+MIRRORS = [
+    "https://old.reddit.com",
+    "https://redlib.privadency.com",
+    "https://redlib.orangenet.cc",
+    "https://red.artemislena.eu",
+]
 
 SUBREDDITS = [
     "college",
@@ -37,50 +49,36 @@ SUBREDDITS = [
     "csMajors",
     "cscareerquestions",
     "GradSchool",
+    "jobs",
+    "resumes",
+    "internships",
+    "student",
+    "students",
+    "collegeadvice",
 ]
 
-# Shorter/broader Reddit queries perform better than long exact phrases.
-QUERY_GROUPS = {
+LISTING_MODES = [
+    ("new", {}),
+    ("hot", {}),
+    ("top", {"t": "month"}),
+    ("top", {"t": "year"}),
+]
+
+KEYWORD_GROUPS = {
     "honor_society": [
-        "honor society",
-        "honor societies",
-        "society invitation",
-        "worth joining",
-        "membership fee",
+        "honor society", "honor societies", "society invitation", "academic society",
+        "worth joining", "worth it", "membership fee", "legit", "scam",
     ],
     "career_resume": [
-        "resume booster",
-        "student organization",
-        "career resources",
-        "networking",
-        "leadership certificate",
+        "resume booster", "resume", "career resources", "career advice", "career help",
+        "networking", "student organization", "student organizations", "leadership",
+        "certificate", "certification", "club", "clubs", "internship", "internships",
     ],
-    "legitimacy_reviews": [
-        "is this legit",
-        "legit or scam",
-        "reviews",
-        "should I join",
-        "worth paying",
-    ],
-    "scholarships": [
-        "scholarships",
-        "college scholarship",
-        "student membership",
+    "scholarship_membership": [
+        "scholarship", "scholarships", "membership", "join", "paying", "fee",
+        "college students", "student membership",
     ],
 }
-
-GLOBAL_QUERIES = [
-    "honor society worth joining",
-    "college honor society legit",
-    "honor society invitation",
-    "student organization resume worth it",
-    "career resources for college students",
-    "resume booster college student",
-    "networking for college students",
-    "membership fee worth it college",
-    "leadership certificate resume",
-    "college scholarship membership",
-]
 
 EXCLUDE_PATTERNS = [
     r"\bSCLA\b",
@@ -92,6 +90,8 @@ EXCLUDE_PATTERNS = [
 
 STRICT_SUBREDDIT_FLAGS = {
     "college": "high - self-promotion rules are strict",
+    "jobs": "high - self-promotion/job services usually removed",
+    "resumes": "high - no advertising/services",
     "GetEmployed": "high - self-promotion rules are strict",
     "GradSchool": "high - advertising/spam rules are strict",
     "careerguidance": "high - link/ad rules are strict",
@@ -119,32 +119,6 @@ class RedditThread:
     relevance_score: int
 
 
-def request_json(session: requests.Session, url: str, params: dict, diagnostics: list[dict], retries: int = 1) -> Optional[dict]:
-    for attempt in range(retries + 1):
-        try:
-            resp = session.get(url, params=params, timeout=12)
-            diagnostics.append({
-                "url": url,
-                "q": params.get("q", ""),
-                "status": resp.status_code,
-                "attempt": attempt + 1,
-                "content_type": resp.headers.get("content-type", ""),
-            })
-            if resp.status_code == 200:
-                return resp.json()
-            print(f"WARN HTTP {resp.status_code} for {url} q={params.get('q')}", flush=True)
-            if resp.status_code in {429, 503} and attempt < retries:
-                time.sleep(2.0)
-                continue
-            return None
-        except Exception as exc:
-            diagnostics.append({"url": url, "q": params.get("q", ""), "status": "exception", "error": str(exc)})
-            print(f"WARN request failed: {exc}", flush=True)
-            if attempt < retries:
-                time.sleep(1.0)
-    return None
-
-
 def clean_text(value: object, max_len: int = 300) -> str:
     text = str(value or "")
     text = re.sub(r"\s+", " ", text).strip()
@@ -155,44 +129,74 @@ def contains_excluded(text: str) -> bool:
     return any(re.search(pattern, text, flags=re.I) for pattern in EXCLUDE_PATTERNS)
 
 
-def matched_terms(title: str, selftext: str, query: str) -> list[str]:
-    haystack = f"{title} {selftext} {query}".lower()
-    terms = [
-        "honor society", "honor societies", "society", "worth joining", "legit", "scam",
-        "resume", "career", "networking", "student organization", "membership", "fee",
-        "scholarship", "leadership", "certificate", "invitation", "review", "college",
-        "internship", "job", "paying", "join",
-    ]
-    return [term for term in terms if term in haystack]
+def find_matches(title: str, selftext: str) -> tuple[str, list[str]]:
+    haystack = f"{title} {selftext}".lower()
+    best_group = "general"
+    matches: list[str] = []
+    for group, terms in KEYWORD_GROUPS.items():
+        group_matches = [term for term in terms if term in haystack]
+        if len(group_matches) > len(matches):
+            matches = group_matches
+            best_group = group
+    return best_group, matches
 
 
-def suggest_angle(terms: Iterable[str]) -> str:
+def suggest_angle(group: str, terms: Iterable[str]) -> str:
     s = set(terms)
-    if "honor society" in s or "honor societies" in s or "invitation" in s or "legit" in s:
+    if group == "honor_society" or "honor society" in s or "legit" in s or "scam" in s:
         return "Compare cost, actual benefits, scholarships, career tools, networking, and independent student feedback."
-    if "resume" in s or "leadership" in s or "certificate" in s:
+    if "resume" in s or "leadership" in s or "certificate" in s or "certification" in s:
         return "Focus on concrete resume value: leadership proof, projects, networking, career support, or scholarship access."
-    if "career" in s or "networking" in s or "internship" in s:
+    if "career resources" in s or "networking" in s or "internship" in s:
         return "Share neutral student-career resource comparison advice, not a hard recommendation."
     return "Helpful neutral advice; link only if rules allow it and it directly answers the thread."
 
 
-def calc_score(post: dict, terms: list[str], group: str) -> int:
+def calc_score(post: dict, terms: list[str], group: str, listing_mode: str) -> int:
     score = int(post.get("score") or 0)
     comments = int(post.get("num_comments") or 0)
-    base = min(score, 120) + min(comments * 4, 180) + len(terms) * 12
-    if group in {"honor_society", "legitimacy_reviews"}:
-        base += 45
+    base = min(score, 150) + min(comments * 4, 220) + len(terms) * 14
+    if group == "honor_society":
+        base += 70
+    elif group == "career_resume":
+        base += 35
+    if listing_mode == "new":
+        base += 20
     created = int(post.get("created_utc") or 0)
     if created:
         age_days = max(0, (dt.datetime.now(dt.timezone.utc).timestamp() - created) / 86400)
         if age_days <= 14:
-            base += 50
+            base += 60
         elif age_days <= 90:
-            base += 25
+            base += 30
         elif age_days > 730:
-            base -= 45
+            base -= 50
     return int(base)
+
+
+def request_listing(session: requests.Session, base_url: str, subreddit: str, mode: str, params_extra: dict, limit: int, diagnostics: list[dict]) -> Optional[dict]:
+    url = f"{base_url}/r/{subreddit}/{mode}.json"
+    params = {"limit": min(limit, 100), "raw_json": "1"}
+    params.update(params_extra)
+    try:
+        resp = session.get(url, params=params, timeout=15)
+        diagnostics.append({
+            "base_url": base_url,
+            "subreddit": subreddit,
+            "mode": mode,
+            "status": resp.status_code,
+            "content_type": resp.headers.get("content-type", ""),
+            "url": url,
+        })
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except Exception:
+                return None
+        return None
+    except Exception as exc:
+        diagnostics.append({"base_url": base_url, "subreddit": subreddit, "mode": mode, "status": "exception", "error": str(exc), "url": url})
+        return None
 
 
 def extract_posts(data: Optional[dict]) -> list[dict]:
@@ -202,33 +206,7 @@ def extract_posts(data: Optional[dict]) -> list[dict]:
     return [child.get("data", {}) for child in children if child.get("kind") == "t3"]
 
 
-def subreddit_search(session: requests.Session, subreddit: str, query: str, limit: int, diagnostics: list[dict], sort: str = "relevance", t: str = "all") -> list[dict]:
-    url = f"https://www.reddit.com/r/{subreddit}/search.json"
-    params = {
-        "q": query,
-        "restrict_sr": "1",
-        "sort": sort,
-        "t": t,
-        "limit": min(limit, 50),
-        "raw_json": "1",
-    }
-    return extract_posts(request_json(session, url, params, diagnostics))
-
-
-def global_search(session: requests.Session, query: str, limit: int, diagnostics: list[dict], sort: str = "relevance", t: str = "all") -> list[dict]:
-    url = "https://www.reddit.com/search.json"
-    params = {
-        "q": query,
-        "type": "link",
-        "sort": sort,
-        "t": t,
-        "limit": min(limit, 50),
-        "raw_json": "1",
-    }
-    return extract_posts(request_json(session, url, params, diagnostics))
-
-
-def add_post(results: list[RedditThread], seen: set[str], source: str, post: dict, group: str, query: str) -> None:
+def add_post(results: list[RedditThread], seen: set[str], source: str, post: dict, listing_mode: str) -> None:
     title = clean_text(post.get("title"), 500)
     selftext = clean_text(post.get("selftext"), 1500)
     subreddit = str(post.get("subreddit") or "")
@@ -239,34 +217,38 @@ def add_post(results: list[RedditThread], seen: set[str], source: str, post: dic
     seen.add(permalink)
     if contains_excluded(combined):
         return
-    terms = matched_terms(title, selftext, query)
+
+    group, terms = find_matches(title, selftext)
     if not terms:
         return
+
     created_ts = int(post.get("created_utc") or 0)
     created_iso = dt.datetime.fromtimestamp(created_ts, tz=dt.timezone.utc).isoformat() if created_ts else ""
-    relevance = calc_score(post, terms, group)
+    relevance = calc_score(post, terms, group, listing_mode)
+    full_permalink = permalink if permalink.startswith("http") else "https://www.reddit.com" + permalink
+
     results.append(
         RedditThread(
             source=source,
             subreddit=subreddit,
             query_group=group,
-            query=query,
+            query=listing_mode,
             title=title,
-            permalink="https://www.reddit.com" + permalink,
+            permalink=full_permalink,
             score=int(post.get("score") or 0),
             num_comments=int(post.get("num_comments") or 0),
             created_utc=created_iso,
             author=str(post.get("author") or ""),
             selftext_preview=clean_text(selftext, 350),
             matched_terms=", ".join(terms),
-            suggested_angle=suggest_angle(terms),
+            suggested_angle=suggest_angle(group, terms),
             risk_level=STRICT_SUBREDDIT_FLAGS.get(subreddit, "unknown/medium - check rules before linking"),
             relevance_score=relevance,
         )
     )
 
 
-def scan(per_query_limit: int, max_results: int, delay: float) -> tuple[list[RedditThread], list[dict], list[dict]]:
+def scan(per_listing_limit: int, max_results: int, delay: float) -> tuple[list[RedditThread], list[dict], list[dict]]:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     seen: set[str] = set()
@@ -274,25 +256,30 @@ def scan(per_query_limit: int, max_results: int, delay: float) -> tuple[list[Red
     diagnostics: list[dict] = []
     query_summary: list[dict] = []
 
-    # Global search first: this often finds better Reddit threads than subreddit-local search.
-    for query in GLOBAL_QUERIES:
-        print(f"Global search: {query}", flush=True)
-        posts = global_search(session, query, per_query_limit, diagnostics, sort="relevance", t="all")
-        query_summary.append({"source": "global", "subreddit": "*", "query": query, "posts_returned": len(posts)})
-        for post in posts:
-            add_post(results, seen, "global", post, "global", query)
-        time.sleep(delay)
-
-    # Subreddit-local search with broad terms.
     for subreddit in SUBREDDITS:
-        for group, queries in QUERY_GROUPS.items():
-            for query in queries:
-                print(f"Subreddit search r/{subreddit}: {query}", flush=True)
-                posts = subreddit_search(session, subreddit, query, per_query_limit, diagnostics, sort="relevance", t="all")
-                query_summary.append({"source": "subreddit", "subreddit": subreddit, "query_group": group, "query": query, "posts_returned": len(posts)})
-                for post in posts:
-                    add_post(results, seen, f"r/{subreddit}", post, group, query)
+        for mode, params_extra in LISTING_MODES:
+            random.shuffle(MIRRORS)
+            posts: list[dict] = []
+            used_source = ""
+            for base_url in MIRRORS:
+                print(f"Fetch {base_url}/r/{subreddit}/{mode}.json", flush=True)
+                data = request_listing(session, base_url, subreddit, mode, params_extra, per_listing_limit, diagnostics)
+                posts = extract_posts(data)
+                if posts:
+                    used_source = base_url
+                    break
                 time.sleep(delay)
+
+            query_summary.append({
+                "subreddit": subreddit,
+                "mode": mode,
+                "params": json.dumps(params_extra),
+                "posts_returned": len(posts),
+                "used_source": used_source,
+            })
+            for post in posts:
+                add_post(results, seen, used_source or "no_source", post, mode)
+            time.sleep(delay)
 
     results.sort(key=lambda x: x.relevance_score, reverse=True)
     return results[:max_results], diagnostics, query_summary
@@ -310,16 +297,11 @@ def write_csv_dicts(rows: list[dict], path: Path) -> None:
         writer.writerows(rows)
 
 
-def write_opportunities_csv(results: list[RedditThread], path: Path) -> None:
-    rows = [asdict(item) for item in results]
-    write_csv_dicts(rows, path)
-
-
 def write_md(results: list[RedditThread], path: Path) -> None:
     lines = [
         "# SCLA Reddit Research Opportunities",
         "",
-        "Filtered for education/career/honor-society related threads that do not already mention SCLA/thescla.org.",
+        "Filtered from recent/top subreddit listings for education/career/honor-society related threads that do not already mention SCLA/thescla.org.",
         "Manual review required. Check each subreddit rule before posting any link.",
         "",
     ]
@@ -330,7 +312,7 @@ def write_md(results: list[RedditThread], path: Path) -> None:
             f"- URL: {item.permalink}",
             f"- Score/comments: {item.score} / {item.num_comments}",
             f"- Created: {item.created_utc}",
-            f"- Source/query: {item.source} / {item.query}",
+            f"- Source/listing: {item.source} / {item.query}",
             f"- Matched terms: {item.matched_terms}",
             f"- Risk: {item.risk_level}",
             f"- Suggested angle: {item.suggested_angle}",
@@ -343,18 +325,18 @@ def write_md(results: list[RedditThread], path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="research_output")
-    parser.add_argument("--per-query-limit", type=int, default=30)
+    parser.add_argument("--per-query-limit", "--per-listing-limit", dest="per_listing_limit", type=int, default=100)
     parser.add_argument("--max-results", type=int, default=250)
-    parser.add_argument("--delay", type=float, default=0.20)
+    parser.add_argument("--delay", type=float, default=0.35)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    results, diagnostics, query_summary = scan(args.per_query_limit, args.max_results, args.delay)
+    results, diagnostics, query_summary = scan(args.per_listing_limit, args.max_results, args.delay)
     rows = [asdict(r) for r in results]
 
-    write_opportunities_csv(results, output_dir / "scla_reddit_opportunities.csv")
+    write_csv_dicts(rows, output_dir / "scla_reddit_opportunities.csv")
     (output_dir / "scla_reddit_opportunities.json").write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
     write_md(results, output_dir / "scla_reddit_opportunities.md")
     write_csv_dicts(query_summary, output_dir / "query_summary.csv")
